@@ -17,12 +17,9 @@ from typing import List, Optional
 
 from supabase import create_client, Client
 
-from pipeline.config import SUPABASE_URL, SUPABASE_KEY, DEFAULT_TICKERS
+from pipeline.config import SUPABASE_URL, SUPABASE_KEY, DEFAULT_TICKERS, BATCH_SIZE
 
 logger = logging.getLogger(__name__)
-
-import os as _os
-BATCH_SIZE = int(_os.getenv("BATCH_SIZE", "100"))
 _client: Optional[Client] = None  # 模块级单例，避免重复初始化
 
 

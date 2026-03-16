@@ -48,13 +48,13 @@ from pipeline.store import (
     get_tracked_tickers,
     update_ticker_timestamps,
 )
-from pipeline.config import DATA_FETCHERS_URL, EMBEDDING_SERVICE_URL, FILING_REFRESH_DAYS, EDGAR_FACTS_MAX_MB
+from pipeline.config import DATA_FETCHERS_URL, EMBEDDING_SERVICE_URL, FILING_REFRESH_DAYS, EDGAR_FACTS_MAX_MB, EMBED_BATCH
 
 logger = logging.getLogger(__name__)
 
 # ── 常量 ─────────────────────────────────────────────────────────────────────
 
-EMBED_BATCH = 100        # 单次发给 embedding-service 的最大块数
+
 TICKER_SLEEP = 1.0       # ticker 之间停顿（秒），守住 Finnhub 60 req/min
 REQUEST_TIMEOUT = 30     # HTTP 请求超时（秒）
 NEWS_LIMIT = 50          # 每次抓新闻条数（避免一次请求太大）
@@ -123,6 +123,18 @@ def _latest_xbrl_date(facts_us_gaap: dict) -> Optional[str]:
     return latest or None
 
 
+def _parse_utc(ts: str) -> datetime:
+    """Supabase timestamp 字符串 → timezone-aware UTC datetime。
+
+    Supabase 返回的时间戳可能不含时区信息（naive），
+    统一补上 UTC，避免与 datetime.now(timezone.utc) 相减时报错。
+    """
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def _fmp_doc_type(period: str) -> str:
     """FMP period 字符串 → doc_type，匹配 schema 约定的合法候选值。
 
@@ -153,13 +165,6 @@ def process_ticker(
     today = _today_iso()
 
     # 是否需要重新抓取 FMP/EDGAR（30天内已抓过则跳过，守住 FMP 250 req/day）
-    def _parse_utc(ts: str) -> datetime:
-        """Parse Supabase timestamp string → timezone-aware UTC datetime."""
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-
     needs_filing_refresh = (
         initial
         or last_filing_fetch is None
@@ -378,6 +383,7 @@ def main() -> None:
     else:
         tickers = get_tracked_tickers()
         logger.info(f"Processing {len(tickers)} tracked tickers")
+        failed: List[str] = []
         for row in tickers:
             try:
                 ticker_type = row.get("ticker_type")
@@ -395,8 +401,14 @@ def main() -> None:
                 )
             except Exception as e:
                 logger.error(f"FAILED {row['ticker']}: {e}", exc_info=True)
+                failed.append(row["ticker"])
             finally:
                 time.sleep(TICKER_SLEEP)  # 守住 Finnhub 60 req/min
+
+        if failed:
+            logger.warning(f"{len(failed)}/{len(tickers)} tickers failed: {failed}")
+        if len(failed) == len(tickers):
+            raise SystemExit(1)  # 全部失败 → CI 显示红色
 
 
 if __name__ == "__main__":

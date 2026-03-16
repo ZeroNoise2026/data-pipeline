@@ -44,6 +44,7 @@ jobs:
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
         run: uvicorn app.main:app --port 8001 &
 
       # ── embedding-service ──────────────────────────────────────
@@ -63,10 +64,11 @@ jobs:
       - name: Wait for services to be ready
         run: |
           for i in $(seq 1 30); do
-            curl -sf http://localhost:8001/health && curl -sf http://localhost:8002/health && break
+            curl -sf http://localhost:8001/health && curl -sf http://localhost:8002/health && echo "Services ready" && exit 0
             echo "Waiting... ($i/30)"
             sleep 2
           done
+          echo "Services failed to start" && exit 1
 
       # ── run pipeline ───────────────────────────────────────────
       - name: Run ingestion pipeline
