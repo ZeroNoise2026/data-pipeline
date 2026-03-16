@@ -6,19 +6,68 @@ on:
   workflow_dispatch:
 
 env:
+  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+  SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
   DATA_FETCHERS_URL: ${{ secrets.DATA_FETCHERS_URL }}
   EMBEDDING_SERVICE_URL: ${{ secrets.EMBEDDING_SERVICE_URL }}
-  SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+  FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+  FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout data-pipeline
+        uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-      - run: pip install -r requirements.txt
-      - run: python -m pipeline.run
+
+      - name: Install pipeline deps
+        run: pip install -r requirements.txt
+
+      # ── data-fetchers ──────────────────────────────────────────
+      - name: Checkout data-fetchers
+        uses: actions/checkout@v4
+        with:
+          repository: ZeroNoise2026/data-fetchers
+          path: data-fetchers
+
+      - name: Install data-fetchers deps
+        run: pip install -r data-fetchers/requirements.txt
+
+      - name: Start data-fetchers
+        working-directory: data-fetchers
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: uvicorn app.main:app --port 8001 &
+
+      # ── embedding-service ──────────────────────────────────────
+      - name: Checkout embedding-service
+        uses: actions/checkout@v4
+        with:
+          repository: ZeroNoise2026/embedding-service
+          path: embedding-service
+
+      - name: Install embedding-service deps
+        run: pip install -r embedding-service/requirements.txt
+
+      - name: Start embedding-service
+        working-directory: embedding-service
+        run: uvicorn app.main:app --port 8002 &
+
+      - name: Wait for services to be ready
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8001/health && curl -sf http://localhost:8002/health && break
+            echo "Waiting... ($i/30)"
+            sleep 2
+          done
+
+      # ── run pipeline ───────────────────────────────────────────
+      - name: Run ingestion pipeline
+        run: python -m pipeline.run
