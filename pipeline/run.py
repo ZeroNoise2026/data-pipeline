@@ -153,12 +153,17 @@ def process_ticker(
     today = _today_iso()
 
     # 是否需要重新抓取 FMP/EDGAR（30天内已抓过则跳过，守住 FMP 250 req/day）
+    def _parse_utc(ts: str) -> datetime:
+        """Parse Supabase timestamp string → timezone-aware UTC datetime."""
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
     needs_filing_refresh = (
         initial
         or last_filing_fetch is None
-        or (datetime.now(timezone.utc) -
-            datetime.fromisoformat(last_filing_fetch.replace("Z", "+00:00"))
-            ).days >= FILING_REFRESH_DAYS
+        or (datetime.now(timezone.utc) - _parse_utc(last_filing_fetch)).days >= FILING_REFRESH_DAYS
     )
 
     # ── 2. 新闻（所有 ticker 类型都抓）───────────────────────────────────────
