@@ -2,7 +2,7 @@ name: Scheduled Data Ingestion
 
 on:
   # schedule:
-  #   - cron: '0 */6 * * *'  # 每 6 小时自动跑一次（需要时取消注释）
+  #   - cron: '0 */6 * * *'  # Every 6 hours (uncomment when ready)
   workflow_dispatch:
 
 env:

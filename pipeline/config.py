@@ -1,6 +1,6 @@
 """
 pipeline/config.py
-从 .env 读取所有服务地址和认证信息。
+Load all service URLs and credentials from .env file.
 """
 
 import os
@@ -9,24 +9,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# 上游服务 URL
+# Upstream service URLs
 DATA_FETCHERS_URL     = os.getenv("DATA_FETCHERS_URL",     "http://localhost:8001")
 EMBEDDING_SERVICE_URL = os.getenv("EMBEDDING_SERVICE_URL", "http://localhost:8002")
 
 # Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")   # https://xxx.supabase.co
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")   # service_role key（写库用）
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")   # service_role key (used for DB writes)
 
-# Supabase 未配置时的备用 ticker 列表
+# Fallback ticker list when Supabase is not configured
 DEFAULT_TICKERS = os.getenv("DEFAULT_TICKERS", "AAPL,MSFT,NVDA").split(",")
 
-# API 配额保护
-FILING_REFRESH_DAYS = int(os.getenv("FILING_REFRESH_DAYS", "30"))   # FMP/EDGAR 重抓间隔（天）
-EDGAR_FACTS_MAX_MB  = float(os.getenv("EDGAR_FACTS_MAX_MB", "15"))  # EDGAR facts JSON 大小上限（MB）
+# API quota protection
+FILING_REFRESH_DAYS = int(os.getenv("FILING_REFRESH_DAYS", "30"))   # FMP/EDGAR re-fetch interval (days)
+EDGAR_FACTS_MAX_MB  = float(os.getenv("EDGAR_FACTS_MAX_MB", "15"))  # EDGAR facts JSON size limit (MB)
 
-# 批量大小（随 Supabase/embedding-service 升级可调大）
-EMBED_BATCH = int(os.getenv("EMBED_BATCH", "100"))   # 单次向量化最大块数
-BATCH_SIZE  = int(os.getenv("BATCH_SIZE",  "100"))   # 单次写库最大行数
+# Batch sizes (can be increased as Supabase/embedding-service scales up)
+EMBED_BATCH = int(os.getenv("EMBED_BATCH", "100"))   # max chunks per embedding request
+BATCH_SIZE  = int(os.getenv("BATCH_SIZE",  "100"))   # max rows per DB write
 
 logging.basicConfig(
     level=logging.INFO,

@@ -1,13 +1,13 @@
 """
 pipeline/store.py
-Supabase 写入层：通过 supabase-py REST API（HTTPS）写入，无需直连 PostgreSQL。
+Supabase write layer: writes via supabase-py REST API (HTTPS), no direct PostgreSQL connection needed.
 
-设计原则：
-  1. 幂等：document id = SHA256(ticker+date+content[:100])[:16]
-  2. upsert = INSERT ... ON CONFLICT DO UPDATE，天天重跑不产生重复数据
-  3. 批量 100 条/次，减少数据库往返次数
-  4. SUPABASE_KEY 未配置时自动切到 dry_run 模式，方便本地调试
-  5. 向量以字符串 '[x1,x2,...]' 形式传给 PostgREST，pgvector 自动转换
+Design principles:
+  1. Idempotent: document id = SHA256(ticker+date+content[:100])[:16]
+  2. Upsert = INSERT ... ON CONFLICT DO UPDATE, safe for daily re-runs without duplicates
+  3. Batch 100 rows/request, reducing database round trips
+  4. When SUPABASE_KEY is not configured, automatically falls back to dry_run mode for local debugging
+  5. Vectors are passed as string '[x1,x2,...]' to PostgREST, pgvector auto-converts
 """
 
 import hashlib
@@ -20,11 +20,11 @@ from supabase import create_client, Client
 from pipeline.config import SUPABASE_URL, SUPABASE_KEY, DEFAULT_TICKERS, BATCH_SIZE
 
 logger = logging.getLogger(__name__)
-_client: Optional[Client] = None  # 模块级单例，避免重复初始化
+_client: Optional[Client] = None  # module-level singleton, avoids repeated initialization
 
 
 def _get_client() -> Optional[Client]:
-    """获取 Supabase client 单例。SUPABASE_KEY 未配置时返回 None。"""
+    """Get Supabase client singleton. Returns None if SUPABASE_KEY is not configured."""
     global _client
     if _client is not None:
         return _client
@@ -40,18 +40,18 @@ def _get_client() -> Optional[Client]:
 
 
 def _vec_str(v: list) -> str:
-    """将 float list 转为 pgvector 格式字符串 '[x1,x2,...]'。"""
+    """Convert float list to pgvector format string '[x1,x2,...]'."""
     return "[" + ",".join(str(x) for x in v) + "]"
 
 
 def make_document_id(ticker: str, date: str, content: str) -> str:
-    """生成确定性 document ID = SHA256(ticker+date+content[:100])[:16]。"""
+    """Generate deterministic document ID = SHA256(ticker+date+content[:100])[:16]."""
     raw = f"{ticker}{date}{content[:100]}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 def upsert_documents(rows: List[dict], dry_run: bool = False) -> int:
-    """批量 upsert 到 documents 表（含 embedding 向量）。"""
+    """Batch upsert to the documents table (including embedding vectors)."""
     if dry_run or not SUPABASE_KEY:
         logger.info(f"[dry_run] upsert {len(rows)} documents")
         for r in rows[:2]:
@@ -69,7 +69,7 @@ def upsert_documents(rows: List[dict], dry_run: bool = False) -> int:
             formatted = []
             for r in batch:
                 row = dict(r)
-                # PostgREST 接受向量字符串 '[x1,x2,...]'，pgvector 自动转换
+                # PostgREST accepts vector string '[x1,x2,...]', pgvector auto-converts
                 if row.get("embedding") is not None:
                     row["embedding"] = _vec_str(row["embedding"])
                 formatted.append(row)
@@ -82,7 +82,7 @@ def upsert_documents(rows: List[dict], dry_run: bool = False) -> int:
 
 
 def upsert_earnings(rows: List[dict], dry_run: bool = False) -> int:
-    """批量 upsert 到 earnings 表。conflict key：(ticker, quarter)"""
+    """Batch upsert to the earnings table. Conflict key: (ticker, quarter)"""
     if dry_run or not SUPABASE_KEY:
         logger.info(f"[dry_run] upsert {len(rows)} earnings rows")
         return len(rows)
@@ -104,7 +104,7 @@ def upsert_earnings(rows: List[dict], dry_run: bool = False) -> int:
 
 
 def upsert_price_snapshot(rows: List[dict], dry_run: bool = False) -> int:
-    """批量 upsert 到 price_snapshot 表。conflict key：(ticker, date)"""
+    """Batch upsert to the price_snapshot table. Conflict key: (ticker, date)"""
     if dry_run or not SUPABASE_KEY:
         logger.info(f"[dry_run] upsert {len(rows)} price snapshots")
         return len(rows)
@@ -126,10 +126,10 @@ def upsert_price_snapshot(rows: List[dict], dry_run: bool = False) -> int:
 
 
 def get_tracked_tickers() -> List[dict]:
-    """从 Supabase 读取所有 is_active=true 的 ticker。
+    """Read all is_active=true tickers from Supabase.
 
-    返回: List[{"ticker": str, "ticker_type": str|None, ...}]
-    如果 Supabase 未配置，回退到 DEFAULT_TICKERS。
+    Returns: List[{"ticker": str, "ticker_type": str|None, ...}]
+    Falls back to DEFAULT_TICKERS if Supabase is not configured.
     """
     client = _get_client()
     if not client:
@@ -160,12 +160,12 @@ def update_ticker_timestamps(
     filing_fetch: Optional[str] = None,
     dry_run: bool = False,
 ) -> None:
-    """更新 tracked_tickers 时间戳，供 Person B 显示数据新鲜度。
+    """Update tracked_tickers timestamps for Person B to display data freshness.
 
-    last_news_fetch     → 新闻最近成功抓取日期
-    last_filing_fetch   → FMP/EDGAR 财报最近成功抓取日期
-    last_successful_run → 最近一次完整处理时间（UTC）
-    非致命操作，失败时只打 warning，不中断主流程。
+    last_news_fetch     → date of most recent successful news fetch
+    last_filing_fetch   → date of most recent successful FMP/EDGAR filing fetch
+    last_successful_run → timestamp of most recent complete processing run (UTC)
+    Non-fatal operation: only logs a warning on failure, doesn't interrupt the main flow.
     """
     if dry_run or not SUPABASE_KEY:
         logger.info(f"[dry_run] timestamps {ticker}: news={news_fetch}, filing={filing_fetch}")
@@ -182,7 +182,7 @@ def update_ticker_timestamps(
         updates["last_filing_fetch"] = filing_fetch
 
     if not updates:
-        return  # 没有要更新的字段，直接返回
+        return  # nothing to update, return directly
 
     try:
         client.table("tracked_tickers").update(updates).eq("ticker", ticker).execute()

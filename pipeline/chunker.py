@@ -1,35 +1,35 @@
 """
 pipeline/chunker.py
-文本分块策略：
-  - 新闻：不切（headline+summary 通常 < 300 chars）
-  - 财报/EDGAR 长文本：512 chars + 64 chars overlap，在句子边界切割
+Text chunking strategies:
+  - News: no splitting (headline+summary is typically < 300 chars)
+  - Earnings/EDGAR long text: 512 chars + 64 chars overlap, split at sentence boundaries
 
-设计考量（Scale）：
-  - 512 chars ≈ 128 tokens，all-MiniLM-L6-v2 最大 256 tokens，安全边界
-  - overlap 64 chars 保留跨块上下文，避免语义断层
-  - 句子边界优先：避免在词中间切断，提升 embedding 质量
-  - 最小块 50 chars：过短的块（如页眉页脚）无信息量，丢弃
+Design considerations (Scale):
+  - 512 chars ≈ 128 tokens, all-MiniLM-L6-v2 max 256 tokens, safe margin
+  - overlap 64 chars preserves cross-chunk context, avoids semantic gaps
+  - Sentence boundary priority: avoids cutting in the middle of words, improves embedding quality
+  - Minimum chunk 50 chars: chunks too short (e.g. headers/footers) carry no information, discard them
 """
 
 from typing import List
 
-CHUNK_SIZE    = 512   # 每块最大字符数
-CHUNK_OVERLAP = 64    # 相邻块重叠字符数
-MIN_CHUNK_LEN = 50    # 小于此长度的块直接丢弃
+CHUNK_SIZE    = 512   # max characters per chunk
+CHUNK_OVERLAP = 64    # overlapping characters between adjacent chunks
+MIN_CHUNK_LEN = 50    # chunks shorter than this are discarded
 
-# 句子边界标志（用于找切割点）
+# Sentence boundary markers (used to find split points)
 _SENTENCE_ENDS = ("。", ". ", "! ", "? ", ".\n", "!\n", "?\n", "\n\n")
 
 
 def _find_sentence_boundary(text: str, start: int, end: int) -> int:
-    """在 [start, end] 范围内，从 end 向前找最近的句子边界。
-    找到返回边界位置，找不到返回 end（硬切）。
+    """Find the nearest sentence boundary searching backward from end within [start, end].
+    Returns the boundary position if found, otherwise returns end (hard cut).
     """
     best = -1
     for sep in _SENTENCE_ENDS:
         pos = text.rfind(sep, start + CHUNK_SIZE // 2, end)
         if pos > best:
-            best = pos + len(sep)  # 切在分隔符之后
+            best = pos + len(sep)  # cut after the separator
     return best if best > start else end
 
 
@@ -38,21 +38,21 @@ def chunk_text(
     chunk_size: int = CHUNK_SIZE,
     overlap: int = CHUNK_OVERLAP,
 ) -> List[str]:
-    """将任意长文本切成有 overlap 的块，优先在句子边界处切割。
+    """Split arbitrary long text into overlapping chunks, preferring sentence boundaries.
 
     Args:
-        text: 已经过 cleaner 清洗的纯文本
-        chunk_size: 每块最大字符数，默认 512
-        overlap: 相邻块重叠字符数，默认 64
+        text: plain text already cleaned by the cleaner
+        chunk_size: max characters per chunk, default 512
+        overlap: overlapping characters between adjacent chunks, default 64
 
     Returns:
-        List[str]，每块 >= MIN_CHUNK_LEN 字符
+        List[str], each chunk >= MIN_CHUNK_LEN characters
     """
     text = text.strip()
     if not text:
         return []
 
-    # 短文本不需要切割
+    # Short text doesn't need splitting
     if len(text) <= chunk_size:
         return [text] if len(text) >= MIN_CHUNK_LEN else []
 
@@ -63,21 +63,21 @@ def chunk_text(
         end = start + chunk_size
 
         if end >= len(text):
-            # 最后一块，直接取剩余
+            # Last chunk: take the remaining text
             chunk = text[start:].strip()
         else:
-            # 尝试在句子边界切割
+            # Try to split at a sentence boundary
             cut = _find_sentence_boundary(text, start, end)
             chunk = text[start:cut].strip()
-            end = cut  # 下一轮从 cut 往前 overlap 开始
+            end = cut  # next iteration starts from cut minus overlap
 
         if len(chunk) >= MIN_CHUNK_LEN:
             chunks.append(chunk)
 
-        # 下一块从 (end - overlap) 开始，保留上下文
+        # Next chunk starts at (end - overlap) to preserve context
         next_start = end - overlap
         if next_start <= start:
-            # 防止死循环（极端情况：整段无任何边界）
+            # Prevent infinite loop (edge case: no boundary found in the entire segment)
             next_start = start + chunk_size
         start = next_start
 
@@ -85,37 +85,38 @@ def chunk_text(
 
 
 def chunk_news(text: str) -> List[str]:
-    """新闻条目：不切割，整条作为一个 chunk。
+    """News items: no splitting, the entire item becomes one chunk.
 
-    新闻 headline+summary 通常 100-400 chars，远小于 512，
-    切割反而会破坏语义完整性。
+    News headline+summary is typically 100-400 chars, well below 512.
+    Splitting would break semantic integrity.
     """
     text = text.strip()
     return [text] if len(text) >= MIN_CHUNK_LEN else []
 
 
 def chunk_filing(text: str) -> List[str]:
-    """SEC 财报全文：按 512 chars + 64 overlap 分块。
+    """SEC filing full text: split into 512 chars + 64 overlap chunks.
 
-    财报全文可达数十万字符，必须分块才能向量化。
+    Filing full text can reach hundreds of thousands of characters and must be chunked for vectorization.
     """
     return chunk_text(text)
 
 
 def chunk_xbrl_facts(ticker: str, facts_us_gaap: dict) -> List[str]:
-    """将 EDGAR XBRL facts 转成可向量化的自然语言描述块。
+    """Convert EDGAR XBRL facts into natural language description chunks for vectorization.
 
-    XBRL 是结构化数据，需要转成文本才能进入 RAG。
-    每个核心财务指标生成一句话描述，若干句打包成一个 chunk。
+    XBRL is structured data that needs to be converted to text for RAG.
+    Each core financial metric generates a one-sentence description,
+    and several sentences are packed into one chunk.
 
     Args:
-        ticker: 股票代码
-        facts_us_gaap: edgar_client.get_company_facts() 返回的 us-gaap 字典
+        ticker: stock ticker symbol
+        facts_us_gaap: the us-gaap dict returned by edgar_client.get_company_facts()
 
     Returns:
-        List[str]，每块描述若干季度的财务数据
+        List[str], each chunk describes several quarters of financial data
     """
-    # 只提取对 RAG 有价值的核心指标
+    # Only extract core metrics valuable for RAG
     METRICS = {
         "NetIncomeLoss":                          "Net Income",
         "Revenues":                               "Revenue",
@@ -134,7 +135,7 @@ def chunk_xbrl_facts(ticker: str, facts_us_gaap: dict) -> List[str]:
             continue
         units = facts_us_gaap[xbrl_key].get("units", {})
         values = units.get("USD", units.get("shares", []))
-        # 只取最近 8 个季度（10-Q + 10-K）
+        # Only take the most recent 8 quarters (10-Q + 10-K)
         quarterly = [v for v in values if v.get("form") in ("10-Q", "10-K")][-8:]
         for v in quarterly:
             end_date = v.get("end", "")
@@ -144,7 +145,7 @@ def chunk_xbrl_facts(ticker: str, facts_us_gaap: dict) -> List[str]:
                 f"{ticker} {human_label} as of {end_date} ({form}): {val:,}"
             )
 
-    # 每 10 句打包成一个 chunk（约 400 chars），保持语义相关性
+    # Pack every 10 sentences into one chunk (~400 chars), maintaining semantic relevance
     chunks: List[str] = []
     for i in range(0, len(sentences), 10):
         chunk = "\n".join(sentences[i : i + 10])
