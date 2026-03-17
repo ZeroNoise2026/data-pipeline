@@ -8,10 +8,10 @@ on:
 env:
   SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
   SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-  DATA_FETCHERS_URL: ${{ secrets.DATA_FETCHERS_URL }}
   EMBEDDING_SERVICE_URL: ${{ secrets.EMBEDDING_SERVICE_URL }}
   FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
   FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+  EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
 
 jobs:
   ingest:
@@ -29,24 +29,6 @@ jobs:
       - name: Install pipeline deps
         run: pip install -r requirements.txt
 
-      # ── data-fetchers ──────────────────────────────────────────
-      - name: Checkout data-fetchers
-        uses: actions/checkout@v4
-        with:
-          repository: ZeroNoise2026/data-fetchers
-          path: data-fetchers
-
-      - name: Install data-fetchers deps
-        run: pip install -r data-fetchers/requirements.txt
-
-      - name: Start data-fetchers
-        working-directory: data-fetchers
-        env:
-          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
-          EDGAR_USER_AGENT: ${{ secrets.EDGAR_USER_AGENT }}
-        run: uvicorn app.main:app --port 8001 &
-
       # ── embedding-service ──────────────────────────────────────
       - name: Checkout embedding-service
         uses: actions/checkout@v4
@@ -61,14 +43,14 @@ jobs:
         working-directory: embedding-service
         run: uvicorn app.main:app --port 8002 &
 
-      - name: Wait for services to be ready
+      - name: Wait for embedding-service
         run: |
           for i in $(seq 1 30); do
-            curl -sf http://localhost:8001/health && curl -sf http://localhost:8002/health && echo "Services ready" && exit 0
+            curl -sf http://localhost:8002/health && echo "Embedding service ready" && exit 0
             echo "Waiting... ($i/30)"
             sleep 2
           done
-          echo "Services failed to start" && exit 1
+          echo "Embedding service failed to start" && exit 1
 
       # ── run pipeline ───────────────────────────────────────────
       - name: Run ingestion pipeline

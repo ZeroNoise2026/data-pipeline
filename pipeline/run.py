@@ -3,7 +3,7 @@ pipeline/run.py
 Main pipeline orchestration: fetch → clean → chunk → embed → store
 
 Usage:
-  # Full run for all tracked tickers (GitHub Actions cron)
+  # Full run for all tracked tickers
   python -m pipeline.run
 
   # Single ticker debug
@@ -17,21 +17,23 @@ Usage:
 
 Architecture principles (Scale-friendly):
   - Each ticker is processed independently; one failure doesn't affect others
-  - Sleep 1s after each request to data-fetchers, respecting Finnhub 60 req/min limit
+  - Sleep 1s after each ticker to respect Finnhub 60 req/min limit
   - Embeddings are batched (100 chunks per request, reducing round trips)
   - DB upsert is idempotent, safe to re-run
   - --dry-run mode: all write operations only log, no actual Supabase writes
-  - Future scaling path: hand process_ticker() to Celery workers for concurrency
+  - Prefect @flow/@task decorators provide orchestration, retry, and observability
 """
 
 import argparse
+import json
 import logging
-import os
+import sys
 import time
 from datetime import datetime, timezone
 from typing import List, Optional, Union
 
 import requests
+from prefect import flow, task
 
 from pipeline.cleaner import (
     clean_news_article,
@@ -48,38 +50,27 @@ from pipeline.store import (
     get_tracked_tickers,
     update_ticker_timestamps,
 )
-from pipeline.config import DATA_FETCHERS_URL, EMBEDDING_SERVICE_URL, FILING_REFRESH_DAYS, EDGAR_FACTS_MAX_MB, EMBED_BATCH
+from pipeline.config import EMBEDDING_SERVICE_URL, FILING_REFRESH_DAYS, EDGAR_FACTS_MAX_MB, EMBED_BATCH
+from pipeline.clients.finnhub_client import FinnhubClient
+from pipeline.clients.edgar_client import EdgarClient
+from pipeline.clients.fmp_client import FMPClient
 
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-
 TICKER_SLEEP = 1.0       # pause between tickers (seconds), respecting Finnhub 60 req/min
-REQUEST_TIMEOUT = 30     # HTTP request timeout (seconds)
+REQUEST_TIMEOUT = 30     # HTTP request timeout (seconds) for embedding-service
 NEWS_LIMIT = 50          # news items per fetch (avoid overly large single requests)
 
+# ── Client instances (module-level singletons) ────────────────────────────────
 
-# ── HTTP utility functions ──────────────────────────────────────────────────────
+finnhub = FinnhubClient()
+edgar = EdgarClient()
+fmp = FMPClient()
 
-def _get(path: str, params: Optional[dict] = None) -> Optional[Union[dict, list]]:
-    """Send a GET request to data-fetchers, return JSON. Returns None on failure."""
-    url = f"{DATA_FETCHERS_URL}{path}"
-    try:
-        r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        mb = len(r.content) / 1024 / 1024
-        if mb > EDGAR_FACTS_MAX_MB:
-            logger.warning(f"Response {mb:.1f}MB > {EDGAR_FACTS_MAX_MB}MB limit, skipping: {url}")
-            return None
-        return r.json()
-    except requests.HTTPError as e:
-        logger.warning(f"HTTP {e.response.status_code} — {url}: {e.response.text[:200]}")
-        return None
-    except Exception as e:
-        logger.warning(f"Request failed — {url}: {e}")
-        return None
 
+# ── Embedding helper (still uses HTTP — embedding-service remains a separate service) ──
 
 def _embed_batch(texts: List[str]) -> List[Optional[List[float]]]:
     """Send a batch of texts to the embedding-service, return a list of vectors.
@@ -147,6 +138,7 @@ def _fmp_doc_type(period: str) -> str:
 
 # ── Single Ticker Processing ────────────────────────────────────────────────────────────
 
+@task(name="process_ticker", log_prints=True)
 def process_ticker(
     ticker: str,
     ticker_type: str,
@@ -176,10 +168,17 @@ def process_ticker(
 
     # ── 2. News (fetched for all ticker types) ───────────────────────────────────────
     # Incremental fetch: if last fetch time exists, only get new content, saving Finnhub 60 req/min quota
-    news_params: dict = {"limit": NEWS_LIMIT}
+    news_days_back = 7
     if not initial and last_news_fetch:
-        news_params["from"] = last_news_fetch
-    news_data = _get(f"/api/finnhub/news/{ticker}", news_params) or []
+        delta = (datetime.now(timezone.utc) - _parse_utc(last_news_fetch)).days
+        news_days_back = max(1, min(delta + 1, 365))
+
+    try:
+        news_data = finnhub.get_company_news(ticker, days_back=news_days_back) or []
+    except Exception as e:
+        logger.warning(f"{ticker} news fetch failed: {e}")
+        news_data = []
+
     for article in news_data:
         try:
             cleaned = clean_news_article(article)
@@ -208,7 +207,12 @@ def process_ticker(
     if ticker_type == "stock":
 
         # 3a. Earnings summary → earnings table + documents table (for semantic search)
-        earnings_data = _get(f"/api/finnhub/earnings/{ticker}") or []
+        try:
+            earnings_data = finnhub.get_earnings_surprises(ticker) or []
+        except Exception as e:
+            logger.warning(f"{ticker} earnings fetch failed: {e}")
+            earnings_data = []
+
         earnings_rows: List[dict] = []
         earnings_doc_texts: List[str] = []   # collect all texts first
         earnings_doc_meta:  List[dict] = []  # corresponding metadata
@@ -259,10 +263,21 @@ def process_ticker(
         if not needs_filing_refresh:
             logger.info(f"  edgar facts → skipped (last fetch: {last_filing_fetch})")
         else:
-            cik_data = _get(f"/api/edgar/cik/{ticker}")
-            if cik_data and "cik" in cik_data:
-                cik = cik_data["cik"]
-                facts_data = _get(f"/api/edgar/facts/{cik}")
+            cik = edgar.ticker_to_cik(ticker)
+            if cik:
+                try:
+                    facts_data = edgar.get_company_facts(cik)
+                except Exception as e:
+                    logger.warning(f"{ticker} EDGAR facts fetch failed: {e}")
+                    facts_data = None
+
+                # Check response size (EDGAR facts can be very large)
+                if facts_data:
+                    facts_size_mb = len(json.dumps(facts_data)) / 1024 / 1024
+                    if facts_size_mb > EDGAR_FACTS_MAX_MB:
+                        logger.warning(f"EDGAR facts {facts_size_mb:.1f}MB > {EDGAR_FACTS_MAX_MB}MB limit, skipping")
+                        facts_data = None
+
                 if facts_data and "facts" in facts_data:
                     us_gaap = facts_data["facts"].get("us-gaap", {})
                     xbrl_chunks = chunk_xbrl_facts(ticker, us_gaap)
@@ -287,8 +302,17 @@ def process_ticker(
         if not needs_filing_refresh:
             logger.info(f"  fmp statements → skipped (last fetch: {last_filing_fetch})")
         else:
-            for stmt_type in ("income-statement", "balance-sheet"):
-                stmt = _get(f"/api/fmp/{stmt_type}/{ticker}", {"limit": 4}) or []
+            fmp_methods = {
+                "income-statement": fmp.get_income_statement,
+                "balance-sheet": fmp.get_balance_sheet,
+            }
+            for stmt_type, method in fmp_methods.items():
+                try:
+                    stmt = method(ticker, limit=4) or []
+                except Exception as e:
+                    logger.warning(f"{ticker} FMP {stmt_type} fetch failed: {e}")
+                    stmt = []
+
                 for period in stmt:
                     try:
                         date_str = period.get("date") or today
@@ -326,7 +350,12 @@ def process_ticker(
             logger.info(f"  fmp statements → done")
 
     # ── 4. Price snapshot (all tickers) ───────────────────────────────────────────
-    quote = _get(f"/api/fmp/quote/{ticker}")
+    try:
+        quote = fmp.get_quote(ticker)
+    except Exception as e:
+        logger.warning(f"{ticker} FMP quote failed: {e}")
+        quote = None
+
     if quote:
         try:
             price_rows = [{
@@ -337,11 +366,13 @@ def process_ticker(
                 "market_cap": int(float(quote.get("marketCap") or 0)) or None,
             }]
             if ticker_type == "stock":
-                # Get PE ratio (Finnhub basic financials)
-                fin = _get(f"/api/finnhub/financials/{ticker}", {"metric": "all"})
-                if fin and "metric" in fin:
-                    price_rows[0]["pe_ratio"] = fin["metric"].get("peNormalizedAnnual")
-                    # marketCap already obtained from FMP quote, don't overwrite (avoid unit discrepancies)
+                # Get PE ratio directly from Finnhub basic financials
+                try:
+                    fin = finnhub.get_basic_financials(ticker)
+                    if fin:
+                        price_rows[0]["pe_ratio"] = fin.get("peNormalizedAnnual")
+                except Exception as e:
+                    logger.warning(f"{ticker} Finnhub financials failed: {e}")
             upsert_price_snapshot(price_rows, dry_run=dry_run)
         except Exception as e:
             logger.warning(f"{ticker} price snapshot error: {e}")
@@ -359,6 +390,7 @@ def process_ticker(
 
 # ── Main entry point ─────────────────────────────────────────────────────────────────────
 
+@flow(name="quant-data-pipeline", log_prints=True)
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run QuantAgent data pipeline")
     parser.add_argument("--ticker", type=str, default=None,
@@ -374,8 +406,11 @@ def main() -> None:
 
     if args.ticker:
         ticker = args.ticker.upper()
-        # Determine type via profile: ETFs return {} (no name field)
-        profile = _get(f"/api/finnhub/profile/{ticker}") or {}
+        # Determine type via Finnhub profile: ETFs return {} (no name field)
+        try:
+            profile = finnhub.get_company_profile(ticker) or {}
+        except Exception:
+            profile = {}
         ticker_type = "stock" if profile.get("name") else "etf"
         logger.info(f"  type detected: {ticker_type} (profile name: {profile.get('name', 'N/A')})")
         process_ticker(
@@ -391,8 +426,11 @@ def main() -> None:
             try:
                 ticker_type = row.get("ticker_type")
                 if not ticker_type:
-                    # Fallback: determine type via profile (when Supabase is not configured or field is empty)
-                    profile = _get(f"/api/finnhub/profile/{row['ticker']}") or {}
+                    # Fallback: determine type via Finnhub profile
+                    try:
+                        profile = finnhub.get_company_profile(row["ticker"]) or {}
+                    except Exception:
+                        profile = {}
                     ticker_type = "stock" if profile.get("name") else "etf"
                 process_ticker(
                     row["ticker"],

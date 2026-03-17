@@ -2,34 +2,48 @@
 
 > QuantAgent Microservice — Data Processing & Storage
 
-Calls data-fetchers to obtain raw data, cleans and chunks it, then calls embedding-service for vectorization, and finally writes to Supabase.
+Fetches raw financial data from Finnhub, SEC EDGAR, and FMP directly via Python clients, cleans and chunks it, calls embedding-service for vectorization, and writes to Supabase.
 
 ## Architecture
 
 ```
-GitHub Actions (cron 6h)
+Prefect Flow (scheduled or manual)
     │
     ▼
 pipeline/run.py
-    ├── GET  data-fetchers/api/...        fetch raw data
-    ├── pipeline/cleaner.py               clean
-    ├── pipeline/chunker.py               chunk
-    ├── POST embedding-service/api/encode vectorize
-    └── pipeline/store.py → Supabase      store
+    ├── pipeline/clients/finnhub_client.py   fetch news, earnings, financials
+    ├── pipeline/clients/edgar_client.py     fetch XBRL facts, filings
+    ├── pipeline/clients/fmp_client.py       fetch quotes, financial statements
+    ├── pipeline/cleaner.py                  clean
+    ├── pipeline/chunker.py                  chunk
+    ├── POST embedding-service/api/encode    vectorize
+    └── pipeline/store.py → Supabase         store
 ```
 
 ## Quick Start
 
 ```bash
-cp .env.example .env   # fill in configuration
+cp .env.example .env   # fill in API keys and configuration
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+
+# Run the full pipeline
 python -m pipeline.run
+
+# Single ticker debug
+python -m pipeline.run --ticker AAPL --dry-run
 ```
+
+## Prefect
+
+This pipeline uses [Prefect](https://www.prefect.io/) for orchestration. You can:
+
+- Run locally with `python -m pipeline.run`
+- Start a Prefect server with `prefect server start` and view flows at http://localhost:4200
+- Deploy to Prefect Cloud for scheduled runs
 
 ## Related Services
 
 | Service | Repo | How This Service Calls It |
 |---------|------|--------------------------|
-| data-fetchers | [data-fetchers](https://github.com/ZeroNoise2026/data-fetchers) | HTTP GET to fetch data |
 | embedding-service | [embedding-service](https://github.com/ZeroNoise2026/embedding-service) | HTTP POST to get vectors |
