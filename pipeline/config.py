@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── API Keys (previously managed by data-fetchers service) ────────────────────
+# ── API Keys ──────────────────────────────────────────────────────────────────
 
 # Finnhub API Key — for news, earnings, financial metrics; free 60 req/min
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")

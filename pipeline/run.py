@@ -136,6 +136,29 @@ def _fmp_doc_type(period: str) -> str:
     """
     return "10-K" if period == "FY" else "10-Q"
 
+
+def _snap_to_quarter_end(date_str: str) -> str:
+    """Snap a date to the nearest calendar quarter end (Mar 31, Jun 30, Sep 30, Dec 31).
+
+    FMP uses fiscal quarter-end dates (e.g. AAPL: Dec 27), while Finnhub uses
+    calendar quarter-end dates (Dec 31). Normalizing both to calendar quarters
+    ensures the upsert on (ticker, quarter) matches correctly.
+
+    Examples: "2025-12-27" → "2025-12-31", "2025-09-27" → "2025-09-30"
+    """
+    from datetime import date as dt_date
+    d = dt_date.fromisoformat(date_str)
+    month = d.month
+    year = d.year
+    if month <= 3:
+        return f"{year}-03-31"
+    elif month <= 6:
+        return f"{year}-06-30"
+    elif month <= 9:
+        return f"{year}-09-30"
+    else:
+        return f"{year}-12-31"
+
 # ── Single Ticker Processing ────────────────────────────────────────────────────────────
 
 @task(name="process_ticker", log_prints=True)
@@ -302,6 +325,7 @@ def process_ticker(
         if not needs_filing_refresh:
             logger.info(f"  fmp statements → skipped (last fetch: {last_filing_fetch})")
         else:
+            fmp_earnings_rows: List[dict] = []  # collect revenue/netIncome to backfill earnings table
             fmp_methods = {
                 "income-statement": fmp.get_income_statement,
                 "balance-sheet": fmp.get_balance_sheet,
@@ -345,8 +369,34 @@ def process_ticker(
                                 "source":   "fmp",
                                 "doc_type": fmp_doc_type,  # "10-K" or "10-Q"
                             })
+
+                        # ── Backfill earnings table from FMP income-statement ──
+                        # FMP has revenue, netIncome, eps that Finnhub doesn't provide.
+                        # Upsert on (ticker, quarter) will update existing rows.
+                        # Snap FMP date to calendar quarter end to match Finnhub's quarter key.
+                        if stmt_type == "income-statement":
+                            rev_raw = period.get("revenue") or 0
+                            ni_raw = period.get("netIncome") or 0
+                            eps_raw = period.get("epsDiluted") or period.get("eps")
+                            quarter_key = _snap_to_quarter_end(date_str)
+                            fmp_earnings_rows.append({
+                                "ticker":     ticker,
+                                "quarter":    quarter_key,
+                                "date":       quarter_key,
+                                "eps":        float(eps_raw) if eps_raw else None,
+                                "revenue":    int(float(rev_raw)),  # BIGINT column
+                                "net_income": int(float(ni_raw)),   # BIGINT column
+                                "guidance":   None,
+                            })
+
                     except Exception as exc:
                         logger.warning(f"{ticker} {stmt_type} period error: {exc}")
+
+            # Write FMP earnings backfill (overwrites Finnhub's incomplete rows)
+            if fmp_earnings_rows:
+                upsert_earnings(fmp_earnings_rows, dry_run=dry_run)
+                logger.info(f"  fmp earnings backfill → {len(fmp_earnings_rows)} quarters (revenue + net_income)")
+
             logger.info(f"  fmp statements → done")
 
     # ── 4. Price snapshot (all tickers) ───────────────────────────────────────────
