@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS documents (
     ticker      VARCHAR(10),
     date        VARCHAR(10),          -- YYYY-MM-DD
     source      VARCHAR(30),          -- finnhub | fmp | edgar
-    doc_type    VARCHAR(20),          -- news | 10-K | 10-Q | earnings
+    doc_type    VARCHAR(20),          -- news | 10-K | 10-Q | earnings | regulatory
     section     VARCHAR(50),
     title       TEXT,
     created_at  TIMESTAMPTZ DEFAULT NOW()
@@ -106,7 +106,27 @@ BEGIN
 END;
 $$;
 
--- 8. Seed initial tracked tickers
+-- 8. User preferences (timezone for daily briefings)
+CREATE TABLE IF NOT EXISTS user_preferences (
+    user_id     UUID        PRIMARY KEY,
+    timezone    TEXT        DEFAULT 'America/New_York',
+    briefing_enabled BOOLEAN DEFAULT TRUE,
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 9. Daily briefings (generated per user per day)
+CREATE TABLE IF NOT EXISTS daily_briefings (
+    user_id         UUID        NOT NULL,
+    briefing_date   VARCHAR(10) NOT NULL,   -- YYYY-MM-DD in user's local timezone
+    content         TEXT        NOT NULL,
+    tickers         TEXT[],                 -- array of tickers included
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (user_id, briefing_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_briefings_user ON daily_briefings (user_id);
+
+-- 10. Seed initial tracked tickers
 INSERT INTO tracked_tickers (ticker, ticker_type) VALUES
     ('AAPL',  'stock'),
     ('MSFT',  'stock'),

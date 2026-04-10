@@ -63,6 +63,32 @@ TICKER_SLEEP = 1.0       # pause between tickers (seconds), respecting Finnhub 6
 REQUEST_TIMEOUT = 30     # HTTP request timeout (seconds) for embedding-service
 NEWS_LIMIT = 50          # news items per fetch (avoid overly large single requests)
 
+# ── Regulatory keyword classifier ────────────────────────────────────────────
+
+import re
+
+_REGULATORY_PATTERN = re.compile(
+    r"""
+    \bSEC\b | \bFDA\b | \bFTC\b | \bDOJ\b | \bEPA\b | \bOSHA\b | \bCFPB\b
+    | \bFINRA\b | \bOCC\b | \bFHFA\b
+    | \b(?:lawsuit|litigation|sued|suing)\b
+    | \b(?:settlement|settled|consent\s+decree)\b
+    | \b(?:fine|fined|penalty|penalt(?:y|ies)|sanction(?:s|ed)?)\b
+    | \b(?:subpoena|indictment|indicted|investigation|investigated|probe|probed)\b
+    | \b(?:compliance|regulatory|regulator|enforcement)\b
+    | \b(?:class[\s-]?action|antitrust|whistleblow)\b
+    | \b(?:recall|recalled|warning\s+letter|cease[\s-]?and[\s-]?desist)\b
+    | \b(?:data\s+breach|privacy\s+violation|GDPR|CCPA)\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _is_regulatory(text: str) -> bool:
+    """Return True if text contains regulatory / compliance keywords."""
+    return bool(_REGULATORY_PATTERN.search(text))
+
+
 # ── Client instances (module-level singletons) ────────────────────────────────
 
 finnhub = FinnhubClient()
@@ -209,6 +235,10 @@ def process_ticker(
             if not chunks:
                 continue
             vectors = _embed_batch(chunks)
+            # Classify: if headline or content contains regulatory keywords → "regulatory"
+            raw_text = (cleaned.get("title", "") + " " + cleaned["content"]).strip()
+            dtype = "regulatory" if _is_regulatory(raw_text) else "news"
+
             for chunk, vec in zip(chunks, vectors):
                 if vec is None:
                     continue  # embedding failed, skip
@@ -219,12 +249,14 @@ def process_ticker(
                     "ticker":   ticker,
                     "date":     cleaned["date"],
                     "source":   cleaned["source"],
-                    "doc_type": "news",
+                    "doc_type": dtype,
                     "title":    cleaned.get("title", ""),
                 })
         except Exception as e:
             logger.warning(f"{ticker} news article error: {e}")
-    logger.info(f"  news → {len(news_data)} articles → {sum(1 for r in doc_rows if r['doc_type']=='news')} chunks")
+    news_chunks = sum(1 for r in doc_rows if r['doc_type'] == 'news')
+    reg_chunks  = sum(1 for r in doc_rows if r['doc_type'] == 'regulatory')
+    logger.info(f"  news → {len(news_data)} articles → {news_chunks} news chunks + {reg_chunks} regulatory chunks")
 
     # ── 3. Stock-specific data ────────────────────────────────────────────────────────
     if ticker_type == "stock":
