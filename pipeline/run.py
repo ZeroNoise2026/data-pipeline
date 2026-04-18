@@ -159,6 +159,25 @@ def _snap_to_quarter_end(date_str: str) -> str:
     else:
         return f"{year}-12-31"
 
+
+def _quarter_label(date_str: str) -> str:
+    """Convert a calendar-quarter-end date to a readable quarter label.
+
+    Used as the `quarter` upsert key in the earnings table. Must be consistent
+    across all data sources (Finnhub, FMP) to avoid duplicate rows for the same
+    fiscal period. Downstream consumers (question-service YoY calc) parse this
+    via regex `Q([1-4])\\s+(\\d{4})`.
+
+    Examples:
+        "2025-12-31" → "Q4 2025"
+        "2025-09-30" → "Q3 2025"
+        "2024-03-31" → "Q1 2024"
+    """
+    from datetime import date as dt_date
+    d = dt_date.fromisoformat(_snap_to_quarter_end(date_str))
+    q = (d.month - 1) // 3 + 1
+    return f"Q{q} {d.year}"
+
 # ── Single Ticker Processing ────────────────────────────────────────────────────────────
 
 @task(name="process_ticker", log_prints=True)
@@ -241,26 +260,30 @@ def process_ticker(
         earnings_doc_meta:  List[dict] = []  # corresponding metadata
         for e in earnings_data:
             try:
-                quarter = e.get("period", "")
-                if not quarter:
+                period_raw = e.get("period", "")
+                if not period_raw:
                     continue
+                # Normalize to "Q3 2025" label so upsert key (ticker, quarter) is
+                # consistent across Finnhub & FMP, and downstream YoY regex can parse it.
+                quarter_label = _quarter_label(period_raw)
+                date_iso      = _snap_to_quarter_end(period_raw)
                 eps     = e.get("actual")        or e.get("estimate")        or 0.0
                 revenue = e.get("revenueActual") or e.get("revenueEstimate") or 0.0
                 earnings_rows.append({
                     "ticker":     ticker,
-                    "quarter":    quarter,
-                    "date":       quarter,
+                    "quarter":    quarter_label,
+                    "date":       date_iso,
                     "eps":        float(eps or 0),
                     "revenue":    int(float(revenue or 0)),  # BIGINT column cannot store floats
                     "net_income": None,
                     "guidance":   None,
                 })
                 text = (
-                    f"{ticker} Q earnings for {quarter}: "
+                    f"{ticker} Q earnings for {quarter_label}: "
                     f"EPS {eps}, revenue {clean_xbrl_value(revenue, 'USD')}."
                 )
                 earnings_doc_texts.append(text)
-                earnings_doc_meta.append({"quarter": quarter, "text": text})
+                earnings_doc_meta.append({"quarter": quarter_label, "date": date_iso, "text": text})
             except Exception as exc:
                 logger.warning(f"{ticker} earnings row error: {exc}")
 
@@ -271,11 +294,11 @@ def process_ticker(
                 if vec is None:
                     continue  # embedding failed, skip this entry
                 doc_rows.append({
-                    "id":        make_document_id(ticker, meta["quarter"], meta["text"]),
+                    "id":        make_document_id(ticker, meta["date"], meta["text"]),
                     "content":   meta["text"],
                     "embedding": vec,
                     "ticker":    ticker,
-                    "date":      meta["quarter"],
+                    "date":      meta["date"],
                     "source":    "finnhub",
                     "doc_type":  "earnings",
                 })
@@ -332,7 +355,9 @@ def process_ticker(
             }
             for stmt_type, method in fmp_methods.items():
                 try:
-                    stmt = method(ticker, limit=4) or []
+                    # limit=5 → FMP free-tier cap; 5 quarters = current Q + same Q prior year,
+                    # enabling YoY comparison. limit>=6 returns 402 Payment Required.
+                    stmt = method(ticker, limit=5) or []
                 except Exception as e:
                     logger.warning(f"{ticker} FMP {stmt_type} fetch failed: {e}")
                     stmt = []
@@ -378,11 +403,12 @@ def process_ticker(
                             rev_raw = period.get("revenue") or 0
                             ni_raw = period.get("netIncome") or 0
                             eps_raw = period.get("epsDiluted") or period.get("eps")
-                            quarter_key = _snap_to_quarter_end(date_str)
+                            quarter_iso   = _snap_to_quarter_end(date_str)
+                            quarter_label = _quarter_label(date_str)
                             fmp_earnings_rows.append({
                                 "ticker":     ticker,
-                                "quarter":    quarter_key,
-                                "date":       quarter_key,
+                                "quarter":    quarter_label,  # "Q4 2025" format (matches Finnhub)
+                                "date":       quarter_iso,
                                 "eps":        float(eps_raw) if eps_raw else None,
                                 "revenue":    int(float(rev_raw)),  # BIGINT column
                                 "net_income": int(float(ni_raw)),   # BIGINT column
