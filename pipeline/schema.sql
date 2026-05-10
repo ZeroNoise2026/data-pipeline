@@ -13,11 +13,15 @@ CREATE TABLE IF NOT EXISTS documents (
     ticker      VARCHAR(10),
     date        VARCHAR(10),          -- YYYY-MM-DD
     source      VARCHAR(30),          -- finnhub | fmp | edgar
-    doc_type    VARCHAR(20),          -- news | 10-K | 10-Q | earnings
+    doc_type    VARCHAR(20),          -- news | 10-K | 10-Q | earnings | regulatory
     section     VARCHAR(50),
     title       TEXT,
+    url         TEXT,                 -- canonical link to original source (news only currently — NULL for filings/earnings)
     created_at  TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Idempotent ALTER for existing deployments (ignored if column already exists).
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS url TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_documents_embedding
     ON documents USING hnsw (embedding vector_cosine_ops)
@@ -106,7 +110,50 @@ BEGIN
 END;
 $$;
 
--- 8. Seed initial tracked tickers
+-- 8. User preferences (timezone for daily briefings)
+CREATE TABLE IF NOT EXISTS user_preferences (
+    user_id     UUID        PRIMARY KEY,
+    timezone    TEXT        DEFAULT 'America/New_York',
+    briefing_enabled BOOLEAN DEFAULT TRUE,
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 9. Daily briefings (generated per user per day)
+CREATE TABLE IF NOT EXISTS daily_briefings (
+    user_id         UUID        NOT NULL,
+    briefing_date   VARCHAR(10) NOT NULL,   -- YYYY-MM-DD in user's local timezone
+    content         TEXT        NOT NULL,
+    tickers         TEXT[],                 -- array of tickers included
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (user_id, briefing_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_briefings_user ON daily_briefings (user_id);
+
+-- 10. Summary cache (Summarization service — input-hash-based dedup, 90-day retention)
+CREATE TABLE IF NOT EXISTS summary_cache (
+    ticker          VARCHAR(10) NOT NULL,
+    input_hash      CHAR(64)    NOT NULL,    -- SHA256 over source_doc_ids + model + prompt_version
+    summary_date    DATE        NOT NULL,
+    content         TEXT        NOT NULL,
+    model           VARCHAR(50) NOT NULL,
+    prompt_version  VARCHAR(20) NOT NULL,
+    tokens_in       INT,
+    tokens_out      INT,
+    source_doc_ids  TEXT[],                  -- lineage: which inputs produced this summary
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (ticker, input_hash)
+);
+
+-- Most-recent-summary lookups
+CREATE INDEX IF NOT EXISTS idx_summary_cache_ticker_created
+    ON summary_cache (ticker, created_at DESC);
+
+-- Cleanup job (DELETE WHERE created_at < NOW() - INTERVAL '90 days')
+CREATE INDEX IF NOT EXISTS idx_summary_cache_created
+    ON summary_cache (created_at);
+
+-- 11. Seed initial tracked tickers
 INSERT INTO tracked_tickers (ticker, ticker_type) VALUES
     ('AAPL',  'stock'),
     ('MSFT',  'stock'),
