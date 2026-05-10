@@ -16,8 +16,12 @@ CREATE TABLE IF NOT EXISTS documents (
     doc_type    VARCHAR(20),          -- news | 10-K | 10-Q | earnings | regulatory
     section     VARCHAR(50),
     title       TEXT,
+    url         TEXT,                 -- canonical link to original source (news only currently — NULL for filings/earnings)
     created_at  TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Idempotent ALTER for existing deployments (ignored if column already exists).
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS url TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_documents_embedding
     ON documents USING hnsw (embedding vector_cosine_ops)

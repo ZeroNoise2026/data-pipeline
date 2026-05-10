@@ -251,6 +251,10 @@ def process_ticker(
                     "source":   cleaned["source"],
                     "doc_type": dtype,
                     "title":    cleaned.get("title", ""),
+                    # Source link for citations: only news has a clean canonical URL.
+                    # Filings/earnings doc rows leave this NULL; the UI falls back
+                    # to "<title> (no link)" for those.
+                    "url":      cleaned.get("url") or None,
                 })
         except Exception as e:
             logger.warning(f"{ticker} news article error: {e}")
