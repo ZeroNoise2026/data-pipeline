@@ -126,7 +126,30 @@ CREATE TABLE IF NOT EXISTS daily_briefings (
 
 CREATE INDEX IF NOT EXISTS idx_briefings_user ON daily_briefings (user_id);
 
--- 10. Seed initial tracked tickers
+-- 10. Summary cache (Summarization service — input-hash-based dedup, 90-day retention)
+CREATE TABLE IF NOT EXISTS summary_cache (
+    ticker          VARCHAR(10) NOT NULL,
+    input_hash      CHAR(64)    NOT NULL,    -- SHA256 over source_doc_ids + model + prompt_version
+    summary_date    DATE        NOT NULL,
+    content         TEXT        NOT NULL,
+    model           VARCHAR(50) NOT NULL,
+    prompt_version  VARCHAR(20) NOT NULL,
+    tokens_in       INT,
+    tokens_out      INT,
+    source_doc_ids  TEXT[],                  -- lineage: which inputs produced this summary
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (ticker, input_hash)
+);
+
+-- Most-recent-summary lookups
+CREATE INDEX IF NOT EXISTS idx_summary_cache_ticker_created
+    ON summary_cache (ticker, created_at DESC);
+
+-- Cleanup job (DELETE WHERE created_at < NOW() - INTERVAL '90 days')
+CREATE INDEX IF NOT EXISTS idx_summary_cache_created
+    ON summary_cache (created_at);
+
+-- 11. Seed initial tracked tickers
 INSERT INTO tracked_tickers (ticker, ticker_type) VALUES
     ('AAPL',  'stock'),
     ('MSFT',  'stock'),
